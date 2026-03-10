@@ -47,6 +47,62 @@ class NanobotDingTalkHandler(CallbackHandler):
         super().__init__()
         self.channel = channel
 
+    async def _download_image(self, download_code: str) -> bytes | None:
+        """Download image from DingTalk using downloadCode."""
+        try:
+            token = await self.channel._get_access_token()
+            if not token:
+                logger.error("Cannot download image: no access token")
+                return None
+
+            url = "https://api.dingtalk.com/v1.0/robot/messageFiles/download"
+            headers = {
+                "x-acs-dingtalk-access-token": token,
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "downloadCode": download_code,
+                "robotCode": self.channel.config.client_id
+            }
+
+            logger.debug("Downloading image with downloadCode: {}...", download_code[:30])
+
+            if not self.channel._http:
+                logger.error("HTTP client not initialized")
+                return None
+
+            resp = await self.channel._http.post(url, json=payload, headers=headers)
+
+            if resp.status_code == 200:
+                # Parse JSON response to get downloadUrl
+                try:
+                    data = resp.json()
+                    download_url = data.get("downloadUrl")
+                    
+                    if not download_url:
+                        logger.error("No downloadUrl in response: {}", data)
+                        return None
+                    
+                    # Download actual image from the URL
+                    logger.debug("Downloading image from URL...")
+                    img_resp = await self.channel._http.get(download_url)
+                    
+                    if img_resp.status_code == 200:
+                        logger.info("Image downloaded: {} bytes", len(img_resp.content))
+                        return img_resp.content
+                    else:
+                        logger.error("Image download failed: status={}", img_resp.status_code)
+                        return None
+                except Exception as parse_err:
+                    logger.error("Failed to parse image response: {}", parse_err)
+                    return None
+            else:
+                logger.error("Image API failed: status={}", resp.status_code)
+                return None
+        except Exception as e:
+            logger.error("Error downloading image: {}", e)
+            return None
+
     async def process(self, message: CallbackMessage):
         """Process incoming stream message."""
         try:
@@ -60,12 +116,34 @@ class NanobotDingTalkHandler(CallbackHandler):
             if not content:
                 content = message.data.get("text", {}).get("content", "").strip()
 
-            if not content:
-                logger.warning(
-                    "Received empty or unsupported message type: {}",
-                    chatbot_msg.message_type,
-                )
+            # Extract image content if present
+            image_content = ""
+            downloaded_images = []
+            try:
+                image_list = chatbot_msg.get_image_list()
+                if image_list:
+                    logger.debug("Received {} images from DingTalk", len(image_list))
+                    for idx, img in enumerate(image_list, 1):
+                        download_code = None
+                        if isinstance(img, str):
+                            download_code = img
+                        elif isinstance(img, dict) and img.get("downloadCode"):
+                            download_code = img.get("downloadCode")
+                        
+                        if download_code:
+                            image_content += f"\n[Image {idx}: downloadCode={download_code}]"
+                            image_bytes = await self._download_image(download_code)
+                            if image_bytes:
+                                downloaded_images.append((idx, image_bytes))
+            except Exception as img_err:
+                logger.warning("Error extracting images: {}", img_err)
+
+            if not content and not image_content:
+                logger.warning("Empty or unsupported message type: {}", chatbot_msg.message_type)
                 return AckMessage.STATUS_OK, "OK"
+
+            # Combine text and image content
+            full_content = content + image_content if content or image_content else ""
 
             sender_id = chatbot_msg.sender_staff_id or chatbot_msg.sender_id
             sender_name = chatbot_msg.sender_nick or "Unknown"
@@ -76,17 +154,32 @@ class NanobotDingTalkHandler(CallbackHandler):
                 or message.data.get("openConversationId")
             )
 
-            logger.info("Received DingTalk message from {} ({}): {}", sender_name, sender_id, content)
+            # Save downloaded images to files
+            media_list = []
+            if downloaded_images:
+                images_dir = Path("/root/.nanobot/workspace/images")
+                images_dir.mkdir(exist_ok=True)
+                for idx, image_bytes in downloaded_images:
+                    image_path = images_dir / f"dingtalk_{sender_id}_{int(time.time())}_{idx}.jpg"
+                    try:
+                        await asyncio.to_thread(image_path.write_bytes, image_bytes)
+                        media_list.append(str(image_path))
+                        logger.debug("Saved image {} to {}", idx, image_path)
+                    except Exception as save_err:
+                        logger.error("Failed to save image {}: {}", idx, save_err)
 
-            # Forward to Nanobot via _on_message (non-blocking).
-            # Store reference to prevent GC before task completes.
+            logger.info("DingTalk message from {}: {} (media: {})", 
+                       sender_name, full_content[:100], len(media_list))
+
+            # Forward to Nanobot via _on_message (non-blocking)
             task = asyncio.create_task(
                 self.channel._on_message(
-                    content,
+                    full_content,
                     sender_id,
                     sender_name,
                     conversation_type,
                     conversation_id,
+                    media_list,
                 )
             )
             self.channel._background_tasks.add(task)
@@ -96,7 +189,6 @@ class NanobotDingTalkHandler(CallbackHandler):
 
         except Exception as e:
             logger.error("Error processing DingTalk message: {}", e)
-            # Return OK to avoid retry loop from DingTalk server
             return AckMessage.STATUS_OK, "Error"
 
 
@@ -447,6 +539,7 @@ class DingTalkChannel(BaseChannel):
         sender_name: str,
         conversation_type: str | None = None,
         conversation_id: str | None = None,
+        media: list[str] | None = None,
     ) -> None:
         """Handle incoming message (called by NanobotDingTalkHandler).
 
@@ -454,13 +547,14 @@ class DingTalkChannel(BaseChannel):
         permission checks before publishing to the bus.
         """
         try:
-            logger.info("DingTalk inbound: {} from {}", content, sender_name)
+            logger.debug("DingTalk inbound: {} from {} (media: {})", content, sender_name, len(media) if media else 0)
             is_group = conversation_type == "2" and conversation_id
             chat_id = f"group:{conversation_id}" if is_group else sender_id
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=chat_id,
                 content=str(content),
+                media=media or [],
                 metadata={
                     "sender_name": sender_name,
                     "platform": "dingtalk",
